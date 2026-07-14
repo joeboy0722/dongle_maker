@@ -61,15 +61,36 @@ std::wstring FindVolumeGuidForDiskPartition(int driveNumber, int partitionNumber
 }
 
 // 內部輔助函式：透過建立子行程執行 Windows 內建 format.exe 進行 FAT32 快速格式化
+// 快速格式化輔助函數：掛載臨時盤符並呼叫 Windows 內置 format.exe 進行 FAT32 快速格式化
 bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
-    // format.exe 不接受尾部的反斜線，例如 "\\\\?\\Volume{GUID}"
-    std::wstring cmdVolume = volumeGuidPath;
-    if (!cmdVolume.empty() && cmdVolume.back() == L'\\') {
-        cmdVolume.pop_back();
+    // 1. 尋找系統中未使用的盤符 (從 Z: 開始往前找)
+    std::wstring tempDrive = L"";
+    DWORD drives = GetLogicalDrives();
+    for (int i = 25; i >= 3; i--) { // Z: down to D:
+        if (!(drives & (1 << i))) {
+            wchar_t letter = L'A' + i;
+            tempDrive = std::wstring(1, letter) + L":\\";
+            break;
+        }
     }
 
-    // 組成格式化指令：快速格式化為 FAT32，磁碟標籤設為 DONGLE，免互動 (/Y)
-    std::wstring commandLine = L"format.exe " + cmdVolume + L" /FS:FAT32 /Q /V:DONGLE /Y";
+    if (tempDrive.empty()) {
+        return false;
+    }
+
+    // 2. 將此 Volume GUID 暫時掛載到該盤符
+    std::wstring targetVol = volumeGuidPath;
+    if (!targetVol.empty() && targetVol.back() != L'\\') {
+        targetVol += L'\\';
+    }
+
+    if (!SetVolumeMountPointW(tempDrive.c_str(), targetVol.c_str())) {
+        return false;
+    }
+
+    // 3. 呼叫 format.exe 執行格式化 (注意 format.exe 的參數為盤符，不包含結尾反斜線，例如 "Z:")
+    std::wstring driveName = tempDrive.substr(0, 2);
+    std::wstring commandLine = L"format.exe " + driveName + L" /FS:FAT32 /Q /V:DONGLE /Y";
     
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
@@ -89,18 +110,20 @@ bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
         &pi
     );
 
-    if (!success) return false;
+    bool formatOk = false;
+    if (success) {
+        WaitForSingleObject(pi.hProcess, INFINITE);
+        DWORD exitCode = 0;
+        GetExitCodeProcess(pi.hProcess, &exitCode);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        formatOk = (exitCode == 0);
+    }
 
-    // 等待格式化完成
-    WaitForSingleObject(pi.hProcess, INFINITE);
-    
-    DWORD exitCode = 0;
-    GetExitCodeProcess(pi.hProcess, &exitCode);
-    
-    CloseHandle(pi.hProcess);
-    CloseHandle(pi.hThread);
-    
-    return (exitCode == 0);
+    // 4. 卸載臨時盤符
+    DeleteVolumeMountPointW(tempDrive.c_str());
+
+    return formatOk;
 }
 
 // 1. 掃描電腦上所有的實體 USB 隨身碟，將資訊填入 infoList 陣列中，回傳掃描到的數量

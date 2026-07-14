@@ -61,36 +61,10 @@ std::wstring FindVolumeGuidForDiskPartition(int driveNumber, int partitionNumber
 }
 
 // 內部輔助函式：透過建立子行程執行 Windows 內建 format.exe 進行 FAT32 快速格式化
-// 快速格式化輔助函數：掛載臨時盤符並呼叫 Windows 內置 format.exe 進行 FAT32 快速格式化
+// 快速格式化輔助函數：直接呼叫 PowerShell 的 Format-Volume 指令，免去掛載盤符的步驟，支援直接對 Volume GUID 進行格式化
 int FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
-    // 1. 尋找系統中未使用的盤符 (從 Z: 開始往前找)
-    std::wstring tempDrive = L"";
-    DWORD drives = GetLogicalDrives();
-    for (int i = 25; i >= 3; i--) { // Z: down to D:
-        if (!(drives & (1 << i))) {
-            wchar_t letter = L'A' + i;
-            tempDrive = std::wstring(1, letter) + L":\\";
-            break;
-        }
-    }
-
-    if (tempDrive.empty()) {
-        return 99999; // 沒有可用盤符
-    }
-
-    // 2. 將此 Volume GUID 暫時掛載到該盤符
-    std::wstring targetVol = volumeGuidPath;
-    if (!targetVol.empty() && targetVol.back() != L'\\') {
-        targetVol += L'\\';
-    }
-
-    if (!SetVolumeMountPointW(tempDrive.c_str(), targetVol.c_str())) {
-        return 50000 + (int)GetLastError(); // 掛載點失敗
-    }
-
-    // 3. 呼叫 format.exe 執行格式化 (注意 format.exe 的參數為盤符，不包含結尾反斜線，例如 "Z:")
-    std::wstring driveName = tempDrive.substr(0, 2);
-    std::wstring commandLine = L"format.exe " + driveName + L" /FS:FAT32 /Q /V:DONGLE /Y";
+    // 建立 PowerShell 命令列參數
+    std::wstring commandLine = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Format-Volume -Path '" + volumeGuidPath + L"' -FileSystem FAT32 -NewFileSystemLabel DONGLE -Force\"";
     
     STARTUPINFOW si = { sizeof(si) };
     PROCESS_INFORMATION pi = { 0 };
@@ -111,9 +85,7 @@ int FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     );
 
     if (!success) {
-        DWORD err = GetLastError();
-        DeleteVolumeMountPointW(tempDrive.c_str());
-        return 60000 + (int)err; // 啟動格式化行程失敗
+        return 60000 + (int)GetLastError(); // 啟動 PowerShell 失敗
     }
 
     WaitForSingleObject(pi.hProcess, INFINITE);
@@ -122,11 +94,8 @@ int FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     CloseHandle(pi.hProcess);
     CloseHandle(pi.hThread);
 
-    // 4. 卸載臨時盤符
-    DeleteVolumeMountPointW(tempDrive.c_str());
-
     if (exitCode != 0) {
-        return 70000 + (int)exitCode; // format.exe 執行失敗，回傳退出碼
+        return 70000 + (int)exitCode; // PowerShell 執行失敗，回傳退出碼
     }
 
     return 0; // 成功

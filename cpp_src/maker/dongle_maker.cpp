@@ -511,6 +511,19 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
         return formatErr;
     }
 
+    // 取得隱形分割區所有掛載點並移除 (以防 Windows 強制指派磁碟機代號)
+    WCHAR pathNames[MAX_PATH] = { 0 };
+    DWORD returnLength = 0;
+    if (GetVolumePathNamesForVolumeNameW(volGuidPath.c_str(), pathNames, MAX_PATH, &returnLength)) {
+        WCHAR* p = pathNames;
+        while (*p) {
+            if (wcslen(p) == 3 && p[1] == L':') {
+                DeleteVolumeMountPointW(p);
+            }
+            p += wcslen(p) + 1;
+        }
+    }
+
     // 7. 搜尋第二個分割區 (一般資料區) 產生的 Volume GUID 並快速格式化為 exFAT
     std::wstring volGuidPath2 = FindVolumeGuidForDiskPartition(driveNumber, 2);
     if (volGuidPath2.empty()) {

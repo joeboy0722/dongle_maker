@@ -16,7 +16,7 @@ namespace dongle_maker_gui
         public static extern int ScanAvailableUsb([Out] UsbDeviceInfo[] infoList, int maxDevices);
 
         [DllImport("libDongleMaker.dll", CallingConvention = CallingConvention.Cdecl)]
-        public static extern bool CreateHiddenPartition(int driveNumber);
+        public static extern int CreateHiddenPartition(int driveNumber);
 
         [DllImport("libDongleMaker.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         public static extern bool WriteHiddenData(int driveNumber, string configData, string password);
@@ -188,12 +188,13 @@ namespace dongle_maker_gui
                 lblStatus.ForeColor = Color.DarkOrange;
                 Application.DoEvents();
 
-                bool partitionOk = CreateHiddenPartition(target.DriveNumber);
-                if (!partitionOk)
+                int errCode = CreateHiddenPartition(target.DriveNumber);
+                if (errCode != 0)
                 {
-                    lblStatus.Text = "建立隱形分割區失敗！";
+                    lblStatus.Text = $"建立隱形分割區失敗！(錯誤碼: {errCode})";
                     lblStatus.ForeColor = Color.Red;
-                    MessageBox.Show("製鎖失敗：無法建立隱藏分割區，請確認是否以管理員權限運行，或隨身碟被寫入保護。", "製鎖失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    string systemErrorMsg = new System.ComponentModel.Win32Exception(errCode).Message;
+                    MessageBox.Show($"製鎖失敗：無法建立隱藏分割區。\n\n[錯誤代碼] {errCode}\n[系統原因描述] {systemErrorMsg}\n\n請確認您的隨身碟是否有實體防寫開關，或被防毒軟體、Windows 檔案總管等進程佔用中。", "製鎖失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 

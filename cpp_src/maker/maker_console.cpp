@@ -51,9 +51,9 @@ int main() {
 
     // 2. 建立隱藏分割區
     std::cout << "\n[*] 正在清除磁碟並建立隱形分割區 (格式化為 FAT32)..." << std::endl;
-    bool createOk = CreateHiddenPartition(target.DriveNumber);
-    if (!createOk) {
-        std::cout << "[!] 建立隱形分割區失敗！請檢查是否以管理員權限執行，或該隨身碟是否被寫入保護。" << std::endl;
+    int err = CreateHiddenPartition(target.DriveNumber);
+    if (err != 0) {
+        std::cout << "[!] 建立隱形分割區失敗！錯誤碼: " << err << std::endl;
         return 0;
     }
     std::cout << "[+] 隱形分割區建立並格式化成功！" << std::endl;

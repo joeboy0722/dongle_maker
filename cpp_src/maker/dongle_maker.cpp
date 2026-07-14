@@ -259,7 +259,7 @@ std::vector<HANDLE> LockAndDismountAllVolumes(int driveNumber) {
     return lockedHandles;
 }
 
-// 2. 對指定的實體隨身碟進行清除、重新分割 (回傳 0 代表成功，失敗則回傳 Win32 錯誤代碼)
+// 2. 對指定的實體隨身碟進行清除、重新分割 (回傳 0 代表成功，失敗則回傳帶有 API 類別前綴的錯誤代碼)
 DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // A. 鎖定並卸載所有存在於該隨身碟上的 Volume
     std::vector<HANDLE> lockedVolumes = LockAndDismountAllVolumes(driveNumber);
@@ -269,7 +269,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     if (hDisk == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
         for (HANDLE h : lockedVolumes) CloseHandle(h);
-        return (err == 0) ? -1 : (int)err;
+        return (err == 0) ? 10000 : (10000 + (int)err);
     }
 
     DWORD bytesReturned = 0;
@@ -290,7 +290,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
         DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
         CloseHandle(hDisk);
         for (HANDLE h : lockedVolumes) CloseHandle(h);
-        return (err == 0) ? -2 : (int)err;
+        return (err == 0) ? 20000 : (20000 + (int)err);
     }
 
     // 3. 設定分割區佈局：建立一個大小為 16MB 的分割區 (MBR 格式必須填寫 4 個 entries)
@@ -331,7 +331,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     }
 
     if (!ok) {
-        return (layoutErr == 0) ? -3 : (int)layoutErr;
+        return (layoutErr == 0) ? 30000 : (30000 + (int)layoutErr);
     }
 
     // C. 重新開啟實體磁碟，強制更新磁碟屬性讓系統重置 Volume 狀態
@@ -347,7 +347,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 5. 搜尋新分割區產生的 Volume GUID
     std::wstring volGuidPath = FindVolumeGuidForDiskPartition(driveNumber, 1);
     if (volGuidPath.empty()) {
-        return 1001; // 找不到對應的 Volume GUID (可能 PnP 太慢或建立失敗)
+        return 40001; // 找不到對應的 Volume GUID (可能 PnP 太慢或建立失敗)
     }
 
     // 6. 將此隱形 Volume 快速格式化為 FAT32

@@ -191,10 +191,45 @@ namespace dongle_maker_gui
                 int errCode = CreateHiddenPartition(target.DriveNumber);
                 if (errCode != 0)
                 {
-                    lblStatus.Text = $"建立隱形分割區失敗！(錯誤碼: {errCode})";
+                    lblStatus.Text = $"建立隱形分割區失敗！(代碼: {errCode})";
                     lblStatus.ForeColor = Color.Red;
-                    string systemErrorMsg = new System.ComponentModel.Win32Exception(errCode).Message;
-                    MessageBox.Show($"製鎖失敗：無法建立隱藏分割區。\n\n[錯誤代碼] {errCode}\n[系統原因描述] {systemErrorMsg}\n\n請確認您的隨身碟是否有實體防寫開關，或被防毒軟體、Windows 檔案總管等進程佔用中。", "製鎖失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+
+                    string apiStep = "未知步驟";
+                    int rawErr = errCode;
+                    if (errCode >= 10000 && errCode < 20000)
+                    {
+                        apiStep = "開啟實體磁碟 (CreateFileW)";
+                        rawErr = errCode - 10000;
+                    }
+                    else if (errCode >= 20000 && errCode < 30000)
+                    {
+                        apiStep = "清除磁碟並建立 MBR 標籤 (IOCTL_DISK_CREATE_DISK)";
+                        rawErr = errCode - 20000;
+                    }
+                    else if (errCode >= 30000 && errCode < 40000)
+                    {
+                        apiStep = "設定隱藏分區佈局 (IOCTL_DISK_SET_DRIVE_LAYOUT_EX)";
+                        rawErr = errCode - 30000;
+                    }
+                    else if (errCode == 40001)
+                    {
+                        apiStep = "定位隱形 Volume GUID 路徑";
+                        rawErr = 0;
+                    }
+                    else if (errCode == 1002)
+                    {
+                        apiStep = "執行 FAT32 快速格式化";
+                        rawErr = 0;
+                    }
+
+                    string systemErrorMsg = (rawErr != 0) ? new System.ComponentModel.Win32Exception(rawErr).Message : "作業逾時或定位失敗。";
+                    string detailMsg = $"製鎖失敗：無法建立隱藏分割區。\n\n" +
+                                      $"[失敗階段] {apiStep}\n" +
+                                      $"[核心錯誤碼] {rawErr} (原始代碼: {errCode})\n" +
+                                      $"[系統原因描述] {systemErrorMsg}\n\n" +
+                                      $"提示：若您在虛擬機 (VM) 環境中，虛擬硬碟映射通常會限制分割區的底層重寫操作。請使用「USB 裝置直通 (USB Passthrough)」將 USB 控制權完全交給虛擬機，或直接在本機運行此製鎖程式。";
+
+                    MessageBox.Show(detailMsg, "製鎖失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
                     return;
                 }
 

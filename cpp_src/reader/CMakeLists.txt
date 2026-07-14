@@ -14,3 +14,15 @@ target_compile_definitions(DongleReader PRIVATE DONGLE_EXPORTS)
 # 測試用控制台程式
 add_executable(ReaderConsole reader_console.cpp)
 target_link_libraries(ReaderConsole PRIVATE DongleReader Setupapi)
+
+# 建置後事件：自動複製 DLL 到 C# 專案 bin 目錄，利於直接執行
+add_custom_command(TARGET DongleReader POST_BUILD
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../../dongle_maker_gui/bin/Debug"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "${CMAKE_CURRENT_SOURCE_DIR}/../../dongle_maker_gui/bin/Release"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:DongleReader>
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../dongle_maker_gui/bin/Debug/$<TARGET_FILE_NAME:DongleReader>"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different
+        $<TARGET_FILE:DongleReader>
+        "${CMAKE_CURRENT_SOURCE_DIR}/../../dongle_maker_gui/bin/Release/$<TARGET_FILE_NAME:DongleReader>"
+)

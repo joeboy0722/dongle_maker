@@ -9,7 +9,9 @@ namespace dongle_maker_gui
 {
     public partial class Form1 : Form
     {
-        // 導入 DongleMaker.dll 中的 C++ 導出 API
+        // ==========================================
+        // 1. 導入 DongleMaker.dll (製鎖端 API)
+        // ==========================================
         [DllImport("libDongleMaker.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         public static extern int ScanAvailableUsb([Out] UsbDeviceInfo[] infoList, int maxDevices);
 
@@ -19,6 +21,17 @@ namespace dongle_maker_gui
         [DllImport("libDongleMaker.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
         public static extern bool WriteHiddenData(int driveNumber, string configData, string password);
 
+
+        // ==========================================
+        // 2. 導入 libDongleReader.dll (讀取/驗證端 API)
+        // ==========================================
+        [DllImport("libDongleReader.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern bool GetUsbHardwareId(int driveNumber, StringBuilder serialOut, int maxLen);
+
+        [DllImport("libDongleReader.dll", CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern bool ReadHiddenData(int driveNumber, string password, StringBuilder dataOut, int maxLen);
+
+
         public Form1()
         {
             InitializeComponent();
@@ -27,15 +40,20 @@ namespace dongle_maker_gui
         // 表單載入初始化
         private void Form1_Load(object sender, EventArgs e)
         {
-            // 設定預設製鎖密碼
+            // 設定預設製鎖與解密密碼
             txtPassword.Text = "joeboy0722_DongleSystem";
+            txtReaderPassword.Text = "joeboy0722_DongleSystem";
 
             // 設定預設 JSON 範例範本
             txtJsonData.Text = "{\r\n  \"level\": 3,\r\n  \"user\": \"admin\",\r\n  \"version\": \"ultimate\",\r\n  \"expires\": \"2029-12-31\"\r\n}";
             
-            // 執行第一次 USB 掃描
+            // 執行第一次 USB 掃描 (同步載入兩分頁)
             RefreshUsbList();
         }
+
+        // ==========================================
+        // 3. Maker 製鎖端介面事件
+        // ==========================================
 
         // 點選重新整理按鈕
         private void btnRefresh_Click(object sender, EventArgs e)
@@ -43,12 +61,17 @@ namespace dongle_maker_gui
             RefreshUsbList();
         }
 
-        // 掃描並重新整理 USB 裝置清單
+        // 掃描並重新整理 USB 裝置清單 (同時載入至 Maker 與 Reader 下拉選單)
         private void RefreshUsbList()
         {
             cboUsbs.Items.Clear();
+            cboReaderUsbs.Items.Clear();
+            
             lblStatus.Text = "正在掃描隨身碟...";
             lblStatus.ForeColor = Color.Blue;
+            lblReaderStatus.Text = "等待驗證...";
+            lblReaderStatus.ForeColor = Color.Blue;
+            
             this.Cursor = Cursors.WaitCursor;
 
             try
@@ -60,9 +83,13 @@ namespace dongle_maker_gui
                 {
                     for (int i = 0; i < count; i++)
                     {
-                        cboUsbs.Items.Add(new UsbDeviceItem(devices[i]));
+                        var item = new UsbDeviceItem(devices[i]);
+                        cboUsbs.Items.Add(item);
+                        cboReaderUsbs.Items.Add(item);
                     }
                     cboUsbs.SelectedIndex = 0;
+                    cboReaderUsbs.SelectedIndex = 0;
+                    
                     lblStatus.Text = $"掃描完成，偵測到 {count} 個符合條件的 USB 裝置。";
                     lblStatus.ForeColor = Color.DarkGreen;
                 }
@@ -74,9 +101,9 @@ namespace dongle_maker_gui
             }
             catch (Exception ex)
             {
-                lblStatus.Text = "掃描時出錯，請確認 libDongleMaker.dll 存在於目錄下。";
+                lblStatus.Text = "掃描時出錯，請確認 DLL 核心檔案存在於目錄下。";
                 lblStatus.ForeColor = Color.Red;
-                MessageBox.Show($"錯誤資訊: {ex.Message}", "掃描錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                MessageBox.Show($"錯誤資訊: {ex.Message}", "載入 DLL 錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
             finally
             {
@@ -101,11 +128,11 @@ namespace dongle_maker_gui
             string password = txtPassword.Text.Trim();
             if (string.IsNullOrEmpty(password))
             {
-                MessageBox.Show("自訂製鎖密碼不能為空！此密碼是軟體鎖授權金鑰計算的關鍵。", "欄位空白", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                MessageBox.Show("自訂製鎖密碼不能為空！", "欄位空白", MessageBoxButtons.OK, MessageBoxIcon.Warning);
                 return;
             }
 
-            // 3. 驗證自訂資料欄位是否為合法 JSON 格式，並取得詳細的錯誤位置
+            // 3. 驗證自訂資料欄位是否為合法 JSON 格式
             string jsonText = txtJsonData.Text.Trim();
             string jsonError = "";
             if (!IsValidJson(jsonText, out jsonError))
@@ -114,17 +141,13 @@ namespace dongle_maker_gui
                 return;
             }
 
-            // 4. 解析 JSON 並自動注入密碼欄位，組合成最終要寫入的加密 JSON 資料
+            // 4. 解析 JSON 並自動注入密碼欄位
             string finalJsonToWrite = "";
             try
             {
                 var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
                 var dict = serializer.Deserialize<Dictionary<string, object>>(jsonText);
-                
-                // 在字典中強制寫入或覆蓋密碼欄位
                 dict["password"] = password;
-                
-                // 重新序列化為 JSON
                 finalJsonToWrite = serializer.Serialize(dict);
             }
             catch (Exception ex)
@@ -133,7 +156,7 @@ namespace dongle_maker_gui
                 return;
             }
 
-            // 5. 毀滅性格式化防呆確認 (二次彈出框)
+            // 5. 毀滅性格式化防呆確認
             string warningMsg = $"您確定要對 PhysicalDrive{target.DriveNumber} ({target.Model}) 進行製鎖燒錄嗎？\n\n" +
                                 "[警告] 此操作將會「清除該隨身碟上所有的檔案與分割區」，資料將無法找回！";
             
@@ -161,10 +184,9 @@ namespace dongle_maker_gui
 
             try
             {
-                // 第一步：清除磁碟並建立隱形分割區
                 lblStatus.Text = "正在清除隨身碟並建立隱形分割區 (請勿拔除裝置)...";
                 lblStatus.ForeColor = Color.DarkOrange;
-                Application.DoEvents(); // 刷新 UI
+                Application.DoEvents();
 
                 bool partitionOk = CreateHiddenPartition(target.DriveNumber);
                 if (!partitionOk)
@@ -175,7 +197,6 @@ namespace dongle_maker_gui
                     return;
                 }
 
-                // 第二步：加密並寫入合併密碼後的 JSON 授權資料
                 lblStatus.Text = "隱形分割區建立成功，正在加密寫入授權字典...";
                 Application.DoEvents();
 
@@ -185,8 +206,6 @@ namespace dongle_maker_gui
                     lblStatus.Text = "燒錄成功！隨身碟已成功轉換為隱形軟體鎖。";
                     lblStatus.ForeColor = Color.Green;
                     
-                    // 計算並列出 License Key 供開發者記錄
-                    // 為了方便開發者，我們可以在對話框中直接列出金鑰計算公式結果
                     MessageBox.Show($"恭喜！隱形授權隨身碟 (Dongle) 燒錄完成！\n\n" +
                                     $"[金鑰對接資訊]\n" +
                                     $"硬體唯一序號：{target.SerialNumber}\n" +
@@ -216,6 +235,105 @@ namespace dongle_maker_gui
                 RefreshUsbList();
             }
         }
+
+        // ==========================================
+        // 4. Reader 讀取端 (DEMO) 介面事件
+        // ==========================================
+
+        // 讀取端重新整理按鈕
+        private void btnReaderRefresh_Click(object sender, EventArgs e)
+        {
+            RefreshUsbList();
+        }
+
+        // 讀取並驗證軟體鎖 (Demo 展示按鈕)
+        private void btnVerify_Click(object sender, EventArgs e)
+        {
+            var selectedItem = cboReaderUsbs.SelectedItem as UsbDeviceItem;
+            if (selectedItem == null)
+            {
+                MessageBox.Show("請先選擇要驗證的 USB 隨身碟！", "操作提示", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            UsbDeviceInfo target = selectedItem.Info;
+            string inputPwd = txtReaderPassword.Text.Trim();
+
+            if (string.IsNullOrEmpty(inputPwd))
+            {
+                MessageBox.Show("請輸入解密密碼！無密碼無法解密授權資料。", "欄位空白", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            // 清空舊的唯讀顯示資料
+            txtSerial.Text = "";
+            txtLicenseData.Text = "";
+            lblReaderStatus.Text = "正在讀取中...";
+            lblReaderStatus.ForeColor = Color.DarkOrange;
+            this.Cursor = Cursors.WaitCursor;
+            Application.DoEvents();
+
+            try
+            {
+                // 1. 取得 USB 晶片序號
+                StringBuilder serialSb = new StringBuilder(256);
+                bool gotId = GetUsbHardwareId(target.DriveNumber, serialSb, serialSb.Capacity);
+                
+                if (gotId)
+                {
+                    txtSerial.Text = serialSb.ToString();
+                }
+                else
+                {
+                    lblReaderStatus.Text = "驗證失敗：無法讀取隨身碟硬體 ID。";
+                    lblReaderStatus.ForeColor = Color.Red;
+                    this.Cursor = Cursors.Default;
+                    return;
+                }
+
+                // 2. 定位隱形分割區並解密讀取內容
+                StringBuilder dataSb = new StringBuilder(4096);
+                bool readOk = ReadHiddenData(target.DriveNumber, inputPwd, dataSb, dataSb.Capacity);
+
+                if (readOk)
+                {
+                    // 格式化輸出 JSON 字串，呈現漂亮排版
+                    string rawJson = dataSb.ToString();
+                    try
+                    {
+                        var serializer = new System.Web.Script.Serialization.JavaScriptSerializer();
+                        var obj = serializer.DeserializeObject(rawJson);
+                        // C# 內建無原生 PrettyPrint 格式化，因此我們直接輸出原始資料，或替換引號美化
+                        txtLicenseData.Text = rawJson.Replace("{\"", "{\r\n  \"").Replace("\",\"", "\",\r\n  \"").Replace("\"}", "\"\r\n}");
+                    }
+                    catch
+                    {
+                        txtLicenseData.Text = rawJson;
+                    }
+
+                    lblReaderStatus.Text = "驗證成功！此隨身碟為合法軟體鎖。";
+                    lblReaderStatus.ForeColor = Color.Green;
+                    MessageBox.Show("驗證成功！\n成功讀取硬體 ID 與解密後的授權字典。", "驗證通過", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                else
+                {
+                    lblReaderStatus.Text = "驗證失敗：解密錯誤或非授權裝置。";
+                    lblReaderStatus.ForeColor = Color.Red;
+                    MessageBox.Show("驗證失敗！\n1. 可能是解密密碼錯誤。\n2. 可能是此隨身碟未進行製鎖。\n3. 或者是隨身碟為拷貝複製碟，與出廠硬體序號不符！", "驗證失敗", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+            }
+            catch (Exception ex)
+            {
+                lblReaderStatus.Text = "讀取過程中發生執行期例外！";
+                lblReaderStatus.ForeColor = Color.Red;
+                MessageBox.Show($"錯誤資訊: {ex.Message}", "執行期錯誤", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                this.Cursor = Cursors.Default;
+            }
+        }
+
 
         // 嚴格驗證 JSON 結構的輔助函式並回傳錯誤原因 (使用 .NET 內建 JavaScriptSerializer)
         private bool IsValidJson(string input, out string errorMessage)

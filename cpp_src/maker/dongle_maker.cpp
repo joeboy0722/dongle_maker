@@ -279,10 +279,10 @@ bool WriteRawMbrFallback(HANDLE hDisk) {
     p1[10] = 0x00;
     p1[11] = 0x00;
 
-    // 分區大小 = 32768 磁區 (對應 16MB) -> 0x00008000 轉小端
+    // 分區大小 = 262144 磁區 (對應 128MB) -> 0x00040000 轉小端
     p1[12] = 0x00;
-    p1[13] = 0x80;
-    p1[14] = 0x00;
+    p1[13] = 0x00;
+    p1[14] = 0x04;
     p1[15] = 0x00;
 
     // 結尾必須是 MBR 的開機特徵碼 0x55, 0xAA
@@ -351,7 +351,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 設定第一個分割區 (隱形分割區)
     pLayout->PartitionEntry[0].PartitionStyle = PARTITION_STYLE_MBR;
     pLayout->PartitionEntry[0].StartingOffset.QuadPart = 1024 * 1024; // 1MB 偏移對齊
-    pLayout->PartitionEntry[0].PartitionLength.QuadPart = 16LL * 1024LL * 1024LL; // 16MB
+    pLayout->PartitionEntry[0].PartitionLength.QuadPart = 128LL * 1024LL * 1024LL; // 128MB
     pLayout->PartitionEntry[0].PartitionNumber = 1;
     pLayout->PartitionEntry[0].RewritePartition = TRUE;
     pLayout->PartitionEntry[0].Mbr.PartitionType = 0x12; // OEM 隱藏分割區 (一般 Windows 檔案總管不分配磁碟機代號且無法直視)

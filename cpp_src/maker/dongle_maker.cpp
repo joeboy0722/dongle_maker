@@ -218,19 +218,66 @@ DONGLE_API int ScanAvailableUsb(UsbDeviceInfo* infoList, int maxDevices) {
     return usbCount;
 }
 
+// 內部輔助函式：鎖定並卸載特定實體磁碟上的所有目前 Volume，以防 Windows 阻擋底層分區覆寫
+std::vector<HANDLE> LockAndDismountAllVolumes(int driveNumber) {
+    std::vector<HANDLE> lockedHandles;
+    WCHAR volumeName[MAX_PATH] = { 0 };
+    HANDLE hVolEnum = FindFirstVolumeW(volumeName, MAX_PATH);
+    if (hVolEnum == INVALID_HANDLE_VALUE) return lockedHandles;
+
+    do {
+        std::wstring volPath = volumeName;
+        if (!volPath.empty() && volPath.back() == L'\\') {
+            volPath.pop_back();
+        }
+
+        // 以 GENERIC_READ | GENERIC_WRITE 權限開啟，以便進行 Lock/Dismount
+        HANDLE hVolume = CreateFileW(volPath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+        if (hVolume != INVALID_HANDLE_VALUE) {
+            VOLUME_DISK_EXTENTS extents = { 0 };
+            DWORD bytesReturned = 0;
+            BOOL success = DeviceIoControl(hVolume, IOCTL_VOLUME_GET_VOLUME_DISK_EXTENTS, NULL, 0, &extents, sizeof(extents), &bytesReturned, NULL);
+            if (success && extents.NumberOfDiskExtents > 0) {
+                if (extents.Extents[0].DiskNumber == (DWORD)driveNumber) {
+                    // 該磁區位於我們要處理的實體隨身碟上，進行強制卸載與鎖定
+                    DeviceIoControl(hVolume, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
+                    if (DeviceIoControl(hVolume, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL)) {
+                        lockedHandles.push_back(hVolume); // 保持控制碼開啟以維護鎖定狀態
+                    } else {
+                        CloseHandle(hVolume);
+                    }
+                } else {
+                    CloseHandle(hVolume);
+                }
+            } else {
+                CloseHandle(hVolume);
+            }
+        }
+    } while (FindNextVolumeW(hVolEnum, volumeName, MAX_PATH));
+
+    FindVolumeClose(hVolEnum);
+    return lockedHandles;
+}
+
 // 2. 對指定的實體隨身碟進行清除、重新分割 (建立一個 MBR 隱藏 OEM 分割區，大小約 16MB)
 DONGLE_API bool CreateHiddenPartition(int driveNumber) {
+    // A. 鎖定並卸載所有存在於該隨身碟上的 Volume
+    std::vector<HANDLE> lockedVolumes = LockAndDismountAllVolumes(driveNumber);
+
     std::wstring drivePath = L"\\\\.\\PhysicalDrive" + std::to_wstring(driveNumber);
     HANDLE hDisk = CreateFileW(drivePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (hDisk == INVALID_HANDLE_VALUE) {
+        for (HANDLE h : lockedVolumes) CloseHandle(h);
         return false;
     }
 
     DWORD bytesReturned = 0;
 
-    // 1. 鎖定並卸載該磁碟上的所有 Volumes，防止 Windows 檔案佔用
+    // 允許擴充 DASD 存取 (強制向驅動程式要求直接讀寫 raw 磁區)
+    DeviceIoControl(hDisk, FSCTL_ALLOW_EXTENDED_DASD_IO, NULL, 0, NULL, 0, &bytesReturned, NULL);
+    
+    // 鎖定實體磁碟
     DeviceIoControl(hDisk, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
-    DeviceIoControl(hDisk, FSCTL_DISMOUNT_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
 
     // 2. 清除舊分割表並初始化磁碟為 MBR
     CREATE_DISK createDisk = {};
@@ -238,12 +285,11 @@ DONGLE_API bool CreateHiddenPartition(int driveNumber) {
     createDisk.Mbr.Signature = 0x87654321;
     BOOL ok = DeviceIoControl(hDisk, IOCTL_DISK_CREATE_DISK, &createDisk, sizeof(createDisk), NULL, 0, &bytesReturned, NULL);
     if (!ok) {
+        DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
         CloseHandle(hDisk);
+        for (HANDLE h : lockedVolumes) CloseHandle(h);
         return false;
     }
-
-    // 強制更新磁碟屬性
-    DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
 
     // 3. 設定分割區佈局：建立一個大小為 16MB 的分割區 (MBR 格式必須填寫 4 個 entries)
     DWORD layoutSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 3 * sizeof(PARTITION_INFORMATION_EX);
@@ -259,7 +305,7 @@ DONGLE_API bool CreateHiddenPartition(int driveNumber) {
     pLayout->PartitionEntry[0].PartitionLength.QuadPart = 16LL * 1024LL * 1024LL; // 16MB
     pLayout->PartitionEntry[0].PartitionNumber = 1;
     pLayout->PartitionEntry[0].RewritePartition = TRUE;
-    pLayout->PartitionEntry[0].Mbr.PartitionType = 0x12; // 0x12 代表 OEM 隱藏分割區 (一般 Windows 檔案總管不分配磁碟機代號且無法直視)
+    pLayout->PartitionEntry[0].Mbr.PartitionType = 0x12; // OEM 隱藏分割區 (一般 Windows 檔案總管不分配磁碟機代號且無法直視)
     pLayout->PartitionEntry[0].Mbr.BootIndicator = FALSE;
     pLayout->PartitionEntry[0].Mbr.RecognizedPartition = TRUE;
 
@@ -270,15 +316,27 @@ DONGLE_API bool CreateHiddenPartition(int driveNumber) {
     }
 
     ok = DeviceIoControl(hDisk, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, pLayout, layoutSize, NULL, 0, &bytesReturned, NULL);
+    
+    // 釋放實體磁碟鎖
+    DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
+    CloseHandle(hDisk);
+
+    // B. 關閉所有舊 Volume 的控制碼以釋放 Volume 鎖，讓 Plug & Play 系統得以建立新 Volume
+    for (HANDLE h : lockedVolumes) {
+        DeviceIoControl(h, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
+        CloseHandle(h);
+    }
+
     if (!ok) {
-        CloseHandle(hDisk);
         return false;
     }
 
-    // 再次強制更新磁碟屬性，讓 Windows 重建 Volume
-    DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
-
-    CloseHandle(hDisk);
+    // C. 重新開啟實體磁碟，強制更新磁碟屬性讓系統重置 Volume 狀態
+    hDisk = CreateFileW(drivePath.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+    if (hDisk != INVALID_HANDLE_VALUE) {
+        DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
+        CloseHandle(hDisk);
+    }
 
     // 4. 等待 3 秒讓 Windows Plug & Play 建立 Volume 節點
     Sleep(3000);

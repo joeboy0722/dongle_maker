@@ -62,7 +62,7 @@ std::wstring FindVolumeGuidForDiskPartition(int driveNumber, int partitionNumber
 
 // 內部輔助函式：透過建立子行程執行 Windows 內建 format.exe 進行 FAT32 快速格式化
 // 快速格式化輔助函數：掛載臨時盤符並呼叫 Windows 內置 format.exe 進行 FAT32 快速格式化
-bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
+int FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     // 1. 尋找系統中未使用的盤符 (從 Z: 開始往前找)
     std::wstring tempDrive = L"";
     DWORD drives = GetLogicalDrives();
@@ -75,7 +75,7 @@ bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     }
 
     if (tempDrive.empty()) {
-        return false;
+        return 99999; // 沒有可用盤符
     }
 
     // 2. 將此 Volume GUID 暫時掛載到該盤符
@@ -85,7 +85,7 @@ bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     }
 
     if (!SetVolumeMountPointW(tempDrive.c_str(), targetVol.c_str())) {
-        return false;
+        return 50000 + (int)GetLastError(); // 掛載點失敗
     }
 
     // 3. 呼叫 format.exe 執行格式化 (注意 format.exe 的參數為盤符，不包含結尾反斜線，例如 "Z:")
@@ -110,20 +110,26 @@ bool FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
         &pi
     );
 
-    bool formatOk = false;
-    if (success) {
-        WaitForSingleObject(pi.hProcess, INFINITE);
-        DWORD exitCode = 0;
-        GetExitCodeProcess(pi.hProcess, &exitCode);
-        CloseHandle(pi.hProcess);
-        CloseHandle(pi.hThread);
-        formatOk = (exitCode == 0);
+    if (!success) {
+        DWORD err = GetLastError();
+        DeleteVolumeMountPointW(tempDrive.c_str());
+        return 60000 + (int)err; // 啟動格式化行程失敗
     }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
 
     // 4. 卸載臨時盤符
     DeleteVolumeMountPointW(tempDrive.c_str());
 
-    return formatOk;
+    if (exitCode != 0) {
+        return 70000 + (int)exitCode; // format.exe 執行失敗，回傳退出碼
+    }
+
+    return 0; // 成功
 }
 
 // 1. 掃描電腦上所有的實體 USB 隨身碟，將資訊填入 infoList 陣列中，回傳掃描到的數量
@@ -434,8 +440,9 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     }
 
     // 6. 將此隱形 Volume 快速格式化為 FAT32
-    if (!FormatVolumeFAT32(volGuidPath)) {
-        return 1002; // 格式化失敗
+    int formatErr = FormatVolumeFAT32(volGuidPath);
+    if (formatErr != 0) {
+        return formatErr;
     }
 
     return 0; // 成功

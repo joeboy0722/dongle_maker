@@ -101,6 +101,45 @@ int FormatVolumeFAT32(const std::wstring& volumeGuidPath) {
     return 0; // 成功
 }
 
+// 快速格式化輔助函數：直接呼叫 PowerShell 的 Format-Volume 指令，直接對指定的 Volume GUID 進行 exFAT 快速格式化並命名標籤
+int FormatVolumeExFAT(const std::wstring& volumeGuidPath) {
+    std::wstring commandLine = L"powershell.exe -NoProfile -ExecutionPolicy Bypass -Command \"Format-Volume -Path '" + volumeGuidPath + L"' -FileSystem exFAT -NewFileSystemLabel USB_DRIVE -Force\"";
+    
+    STARTUPINFOW si = { sizeof(si) };
+    PROCESS_INFORMATION pi = { 0 };
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE; // 隱藏主控台視窗
+
+    BOOL success = CreateProcessW(
+        NULL,
+        &commandLine[0],
+        NULL,
+        NULL,
+        FALSE,
+        CREATE_NO_WINDOW,
+        NULL,
+        NULL,
+        &si,
+        &pi
+    );
+
+    if (!success) {
+        return 80000 + (int)GetLastError(); // 啟動 PowerShell 失敗
+    }
+
+    WaitForSingleObject(pi.hProcess, INFINITE);
+    DWORD exitCode = 0;
+    GetExitCodeProcess(pi.hProcess, &exitCode);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+
+    if (exitCode != 0) {
+        return 90000 + (int)exitCode; // PowerShell 執行失敗，回傳退出碼
+    }
+
+    return 0; // 成功
+}
+
 // 1. 掃描電腦上所有的實體 USB 隨身碟，將資訊填入 infoList 陣列中，回傳掃描到的數量
 DONGLE_API int ScanAvailableUsb(UsbDeviceInfo* infoList, int maxDevices) {
     HDEVINFO hDevInfo = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_DISK_MAKER, NULL, NULL, DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -259,31 +298,61 @@ std::vector<HANDLE> LockAndDismountAllVolumes(int driveNumber) {
 
 // 2. 對指定的實體隨身碟進行清除、重新分割 (回傳 0 代表成功，失敗則回傳帶有 API 類別前綴的錯誤代碼)
 // 內部輔助函式：當 Windows 高階分區 API 因為 Removable 限制拒絕執行時，直接對磁碟 Sector 0 (MBR) 寫入分區表
-bool WriteRawMbrFallback(HANDLE hDisk) {
+bool WriteRawMbrFallback(HANDLE hDisk, unsigned long long totalDiskBytes) {
     std::vector<BYTE> sector(512, 0);
 
-    // 取得第一個分區的指標 (MBR 分區表位於 Sector 0 的最後 64 位元組，自 offset 446 開始)
+    // 取得第一個分區的指標 (MBR 分區表自 offset 446 開始，每個 entry 16 bytes)
     BYTE* p1 = sector.data() + 446;
-    p1[0] = 0x00; // 開機指示 (非開機磁區)
-    p1[1] = 0x00; // CHS 起始位址 (現代 OS 忽略)
+    p1[0] = 0x00; // 非開機磁區
+    p1[1] = 0x00; // CHS 起始
     p1[2] = 0x00;
     p1[3] = 0x00;
     p1[4] = 0x12; // 分區類型：0x12 OEM 隱藏分割區
-    p1[5] = 0x00; // CHS 結束位址 (現代 OS 忽略)
+    p1[5] = 0x00; // CHS 結束
     p1[6] = 0x00;
     p1[7] = 0x00;
 
-    // 起始 LBA = 2048 (1MB 偏移處，對應 2048 個 512-byte 磁區) -> 0x00000800 轉小端
+    // 起始 LBA = 2048 (1MB 偏移處) -> 0x00000800 轉小端
     p1[8] = 0x00;
     p1[9] = 0x08;
     p1[10] = 0x00;
     p1[11] = 0x00;
 
-    // 分區大小 = 262144 磁區 (對應 128MB) -> 0x00040000 轉小端
+    // 分區大小 = 262144 磁區 (128MB) -> 0x00040000 轉小端
     p1[12] = 0x00;
     p1[13] = 0x00;
     p1[14] = 0x04;
     p1[15] = 0x00;
+
+    // 取得第二個分區的指標 (offset 446 + 16 = 462)
+    BYTE* p2 = sector.data() + 462;
+    p2[0] = 0x00;
+    p2[1] = 0x00;
+    p2[2] = 0x00;
+    p2[3] = 0x00;
+    p2[4] = 0x07; // 分區類型：0x07 exFAT / NTFS
+    p2[5] = 0x00;
+    p2[6] = 0x00;
+    p2[7] = 0x00;
+
+    // 起始 LBA = 264192 (129MB 偏移處) -> 0x00040800 轉小端
+    p2[8] = 0x00;
+    p2[9] = 0x08;
+    p2[10] = 0x04;
+    p2[11] = 0x00;
+
+    // 計算第二分區大小 (磁區數)
+    unsigned long long totalSectors = totalDiskBytes / 512;
+    unsigned long long part2Sectors = 0;
+    if (totalSectors > 266240) {
+        part2Sectors = totalSectors - 264192 - 2048; // 預留最後 1MB (2048 磁區) 作為安全邊界
+    }
+
+    // 寫入第二分區大小 (4 bytes 轉小端)
+    p2[12] = (BYTE)(part2Sectors & 0xFF);
+    p2[13] = (BYTE)((part2Sectors >> 8) & 0xFF);
+    p2[14] = (BYTE)((part2Sectors >> 16) & 0xFF);
+    p2[15] = (BYTE)((part2Sectors >> 24) & 0xFF);
 
     // 結尾必須是 MBR 的開機特徵碼 0x55, 0xAA
     sector[510] = 0x55;
@@ -324,6 +393,18 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 鎖定實體磁碟
     DeviceIoControl(hDisk, FSCTL_LOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
 
+    // 獲取磁碟大小
+    DISK_GEOMETRY_EX geom = {};
+    BOOL gotGeom = DeviceIoControl(hDisk, IOCTL_DISK_GET_DRIVE_GEOMETRY_EX, NULL, 0, &geom, sizeof(geom), &bytesReturned, NULL);
+    if (!gotGeom) {
+        DWORD err = GetLastError();
+        DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
+        CloseHandle(hDisk);
+        for (HANDLE h : lockedVolumes) CloseHandle(h);
+        return (err == 0) ? 25000 : (25000 + (int)err);
+    }
+    unsigned long long totalDiskBytes = geom.DiskSize.QuadPart;
+
     // 2. 清除舊分割表並初始化磁碟為 MBR
     CREATE_DISK createDisk = {};
     createDisk.PartitionStyle = PARTITION_STYLE_MBR;
@@ -340,7 +421,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 強制更新磁碟屬性，讓 Windows 記憶體更新磁碟狀態，避免後續 SET_DRIVE_LAYOUT 失敗
     DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
 
-    // 3. 設定分割區佈局：建立一個大小為 16MB 的分割區 (MBR 格式必須填寫 4 個 entries)
+    // 3. 設定分割區佈局：建立雙分割區佈局 (MBR 格式必須填寫 4 個 entries)
     DWORD layoutSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 3 * sizeof(PARTITION_INFORMATION_EX);
     std::vector<BYTE> layoutBuf(layoutSize, 0);
     PDRIVE_LAYOUT_INFORMATION_EX pLayout = (PDRIVE_LAYOUT_INFORMATION_EX)layoutBuf.data();
@@ -348,7 +429,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     pLayout->PartitionCount = 4;
     pLayout->Mbr.Signature = 0x87654321;
 
-    // 設定第一個分割區 (隱形分割區)
+    // 設定第一個分割區 (隱形分割區 - 128MB)
     pLayout->PartitionEntry[0].PartitionStyle = PARTITION_STYLE_MBR;
     pLayout->PartitionEntry[0].StartingOffset.QuadPart = 1024 * 1024; // 1MB 偏移對齊
     pLayout->PartitionEntry[0].PartitionLength.QuadPart = 128LL * 1024LL * 1024LL; // 128MB
@@ -358,8 +439,24 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     pLayout->PartitionEntry[0].Mbr.BootIndicator = FALSE;
     pLayout->PartitionEntry[0].Mbr.RecognizedPartition = TRUE;
 
-    // 其餘三個設為空分割區
-    for (int i = 1; i < 4; i++) {
+    // 設定第二個分割區 (一般資料分割區 - 剩餘全部容量)
+    unsigned long long part2Start = 129LL * 1024LL * 1024LL; // 129MB 偏移
+    unsigned long long part2Length = 0;
+    if (totalDiskBytes > part2Start + 1024 * 1024) {
+        part2Length = totalDiskBytes - part2Start - 1024 * 1024; // 預留最後 1MB 安全空間
+    }
+
+    pLayout->PartitionEntry[1].PartitionStyle = PARTITION_STYLE_MBR;
+    pLayout->PartitionEntry[1].StartingOffset.QuadPart = part2Start;
+    pLayout->PartitionEntry[1].PartitionLength.QuadPart = part2Length;
+    pLayout->PartitionEntry[1].PartitionNumber = 2;
+    pLayout->PartitionEntry[1].RewritePartition = TRUE;
+    pLayout->PartitionEntry[1].Mbr.PartitionType = 0x07; // 0x07 代表 exFAT / NTFS
+    pLayout->PartitionEntry[1].Mbr.BootIndicator = FALSE;
+    pLayout->PartitionEntry[1].Mbr.RecognizedPartition = TRUE;
+
+    // 其餘兩個設為空分割區
+    for (int i = 2; i < 4; i++) {
         pLayout->PartitionEntry[i].PartitionStyle = PARTITION_STYLE_MBR;
         pLayout->PartitionEntry[i].RewritePartition = TRUE;
         pLayout->PartitionEntry[i].Mbr.PartitionType = 0; // Empty
@@ -370,7 +467,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     
     // 若高階 API 回傳不支援 (通常是 Removable 隨身碟硬體限制)，執行直接寫入 Sector 0 的備用方案
     if (!ok) {
-        if (WriteRawMbrFallback(hDisk)) {
+        if (WriteRawMbrFallback(hDisk, totalDiskBytes)) {
             ok = TRUE;
             layoutErr = 0;
         } else {
@@ -402,7 +499,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 4. 等待 3 秒讓 Windows Plug & Play 建立 Volume 節點
     Sleep(3000);
 
-    // 5. 搜尋新分割區產生的 Volume GUID
+    // 5. 搜尋第一個分割區 (隱形磁區) 產生的 Volume GUID
     std::wstring volGuidPath = FindVolumeGuidForDiskPartition(driveNumber, 1);
     if (volGuidPath.empty()) {
         return 40001; // 找不到對應認知的 Volume GUID (可能 PnP 太慢或建立失敗)
@@ -412,6 +509,22 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     int formatErr = FormatVolumeFAT32(volGuidPath);
     if (formatErr != 0) {
         return formatErr;
+    }
+
+    // 7. 搜尋第二個分割區 (一般資料區) 產生的 Volume GUID 並快速格式化為 exFAT
+    std::wstring volGuidPath2 = FindVolumeGuidForDiskPartition(driveNumber, 2);
+    if (volGuidPath2.empty()) {
+        Sleep(2000); // 如果沒找到，延遲 2 秒再試一次
+        volGuidPath2 = FindVolumeGuidForDiskPartition(driveNumber, 2);
+    }
+
+    if (!volGuidPath2.empty()) {
+        int formatErr2 = FormatVolumeExFAT(volGuidPath2);
+        if (formatErr2 != 0) {
+            return formatErr2;
+        }
+    } else {
+        return 40002; // 找不到可見儲存分區的 Volume GUID
     }
 
     return 0; // 成功

@@ -260,6 +260,52 @@ std::vector<HANDLE> LockAndDismountAllVolumes(int driveNumber) {
 }
 
 // 2. 對指定的實體隨身碟進行清除、重新分割 (回傳 0 代表成功，失敗則回傳帶有 API 類別前綴的錯誤代碼)
+// 內部輔助函式：當 Windows 高階分區 API 因為 Removable 限制拒絕執行時，直接對磁碟 Sector 0 (MBR) 寫入分區表
+bool WriteRawMbrFallback(HANDLE hDisk) {
+    std::vector<BYTE> sector(512, 0);
+
+    // 取得第一個分區的指標 (MBR 分區表位於 Sector 0 的最後 64 位元組，自 offset 446 開始)
+    BYTE* p1 = sector.data() + 446;
+    p1[0] = 0x00; // 開機指示 (非開機磁區)
+    p1[1] = 0x00; // CHS 起始位址 (現代 OS 忽略)
+    p1[2] = 0x00;
+    p1[3] = 0x00;
+    p1[4] = 0x12; // 分區類型：0x12 OEM 隱藏分割區
+    p1[5] = 0x00; // CHS 結束位址 (現代 OS 忽略)
+    p1[6] = 0x00;
+    p1[7] = 0x00;
+
+    // 起始 LBA = 2048 (1MB 偏移處，對應 2048 個 512-byte 磁區) -> 0x00000800 轉小端
+    p1[8] = 0x00;
+    p1[9] = 0x08;
+    p1[10] = 0x00;
+    p1[11] = 0x00;
+
+    // 分區大小 = 32768 磁區 (對應 16MB) -> 0x00008000 轉小端
+    p1[12] = 0x00;
+    p1[13] = 0x80;
+    p1[14] = 0x00;
+    p1[15] = 0x00;
+
+    // 結尾必須是 MBR 的開機特徵碼 0x55, 0xAA
+    sector[510] = 0x55;
+    sector[511] = 0xAA;
+
+    // 移動檔案指標到 Sector 0 最前端
+    LARGE_INTEGER li = {};
+    li.QuadPart = 0;
+    if (!SetFilePointerEx(hDisk, li, NULL, FILE_BEGIN)) {
+        return false;
+    }
+
+    DWORD bytesWritten = 0;
+    if (!WriteFile(hDisk, sector.data(), 512, &bytesWritten, NULL) || bytesWritten != 512) {
+        return false;
+    }
+
+    return true;
+}
+
 DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // A. 鎖定並卸載所有存在於該隨身碟上的 Volume
     std::vector<HANDLE> lockedVolumes = LockAndDismountAllVolumes(driveNumber);
@@ -293,6 +339,9 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
         return (err == 0) ? 20000 : (20000 + (int)err);
     }
 
+    // 強制更新磁碟屬性，讓 Windows 記憶體更新磁碟狀態，避免後續 SET_DRIVE_LAYOUT 失敗
+    DeviceIoControl(hDisk, IOCTL_DISK_UPDATE_PROPERTIES, NULL, 0, NULL, 0, &bytesReturned, NULL);
+
     // 3. 設定分割區佈局：建立一個大小為 16MB 的分割區 (MBR 格式必須填寫 4 個 entries)
     DWORD layoutSize = sizeof(DRIVE_LAYOUT_INFORMATION_EX) + 3 * sizeof(PARTITION_INFORMATION_EX);
     std::vector<BYTE> layoutBuf(layoutSize, 0);
@@ -314,12 +363,23 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 其餘三個設為空分割區
     for (int i = 1; i < 4; i++) {
         pLayout->PartitionEntry[i].PartitionStyle = PARTITION_STYLE_MBR;
+        pLayout->PartitionEntry[i].RewritePartition = TRUE;
         pLayout->PartitionEntry[i].Mbr.PartitionType = 0; // Empty
     }
 
     ok = DeviceIoControl(hDisk, IOCTL_DISK_SET_DRIVE_LAYOUT_EX, pLayout, layoutSize, NULL, 0, &bytesReturned, NULL);
     DWORD layoutErr = ok ? 0 : GetLastError();
     
+    // 若高階 API 回傳不支援 (通常是 Removable 隨身碟硬體限制)，執行直接寫入 Sector 0 的備用方案
+    if (!ok) {
+        if (WriteRawMbrFallback(hDisk)) {
+            ok = TRUE;
+            layoutErr = 0;
+        } else {
+            layoutErr = GetLastError();
+        }
+    }
+
     // 釋放實體磁碟鎖
     DeviceIoControl(hDisk, FSCTL_UNLOCK_VOLUME, NULL, 0, NULL, 0, &bytesReturned, NULL);
     CloseHandle(hDisk);
@@ -347,7 +407,7 @@ DONGLE_API int CreateHiddenPartition(int driveNumber) {
     // 5. 搜尋新分割區產生的 Volume GUID
     std::wstring volGuidPath = FindVolumeGuidForDiskPartition(driveNumber, 1);
     if (volGuidPath.empty()) {
-        return 40001; // 找不到對應的 Volume GUID (可能 PnP 太慢或建立失敗)
+        return 40001; // 找不到對應認知的 Volume GUID (可能 PnP 太慢或建立失敗)
     }
 
     // 6. 將此隱形 Volume 快速格式化為 FAT32
